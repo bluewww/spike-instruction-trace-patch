@@ -1,0 +1,417 @@
+diff --git a/riscv/clint.cc b/riscv/clint.cc
+index 08508b4..7fd4f0c 100644
+--- a/riscv/clint.cc
++++ b/riscv/clint.cc
+@@ -4,6 +4,7 @@
+ clint_t::clint_t(std::vector<processor_t*>& procs)
+   : procs(procs), mtimecmp(procs.size())
+ {
++  mtime = 0;
+ }
+ 
+ /* 0000 msip hart 0
+diff --git a/riscv/execute.cc b/riscv/execute.cc
+index e639e90..b56db9f 100644
+--- a/riscv/execute.cc
++++ b/riscv/execute.cc
+@@ -85,7 +85,7 @@ static reg_t execute_insn(processor_t* p, reg_t pc, insn_fetch_t fetch)
+ 
+ bool processor_t::slow_path()
+ {
+-  return debug || state.single_step != state.STEP_NONE || state.dcsr.cause;
++  return trace || debug || state.single_step != state.STEP_NONE || state.dcsr.cause;
+ }
+ 
+ // fetch/decode/execute loop
+@@ -142,7 +142,7 @@ void processor_t::step(size_t n)
+           }
+ 
+           insn_fetch_t fetch = mmu->load_insn(pc);
+-          if (debug && !state.serialized)
++          if ((trace || debug) && !state.serialized)
+             disasm(fetch.insn);
+           pc = execute_insn(this, pc, fetch);
+ 
+diff --git a/riscv/extension.h b/riscv/extension.h
+index d1e847d..419b172 100644
+--- a/riscv/extension.h
++++ b/riscv/extension.h
+@@ -16,6 +16,7 @@ class extension_t
+   virtual const char* name() = 0;
+   virtual void reset() {};
+   virtual void set_debug(bool value) {};
++  virtual void set_trace(bool value) {};
+   virtual ~extension_t();
+ 
+   void set_processor(processor_t* _p) { p = _p; }
+diff --git a/riscv/processor.cc b/riscv/processor.cc
+index 4a7d0ec..bceaaa2 100644
+--- a/riscv/processor.cc
++++ b/riscv/processor.cc
+@@ -5,6 +5,7 @@
+ #include "common.h"
+ #include "config.h"
+ #include "simif.h"
++#include "ust_tracer.h"
+ #include "mmu.h"
+ #include "disasm.h"
+ #include <cinttypes>
+@@ -21,7 +22,7 @@
+ 
+ processor_t::processor_t(const char* isa, simif_t* sim, uint32_t id,
+         bool halt_on_reset)
+-  : debug(false), halt_request(false), sim(sim), ext(NULL), id(id),
++    : debug(false), trace(false), halt_request(false), sim(sim), ext(NULL), id(id),
+   halt_on_reset(halt_on_reset), last_pc(1), executions(1)
+ {
+   parse_isa_string(isa);
+@@ -34,6 +35,8 @@ processor_t::processor_t(const char* isa, simif_t* sim, uint32_t id,
+     for (auto disasm_insn : ext->get_disasms())
+       disassembler->add_insn(disasm_insn);
+ 
++  xlen = 0;
++
+   reset();
+ }
+ 
+@@ -125,6 +128,8 @@ void state_t::reset(reg_t max_isa)
+   misa = max_isa;
+   prv = PRV_M;
+   pc = DEFAULT_RSTVEC;
++  mstatus = 0;
++  dcsr.cause = 0;
+   tselect = 0;
+   for (unsigned int i = 0; i < num_triggers; i++)
+     mcontrol[i].type = 2;
+@@ -137,6 +142,13 @@ void processor_t::set_debug(bool value)
+     ext->set_debug(value);
+ }
+ 
++void processor_t::set_trace(bool value)
++{
++  trace = value;
++  if (ext)
++    ext->set_trace(value);
++}
++
+ void processor_t::set_histogram(bool value)
+ {
+   histogram_enabled = value;
+@@ -251,6 +263,13 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
+           t.get_tval());
+   }
+ 
++  if (trace) {
++      ust_set_exception(t.cause());
++      if (t.has_tval())
++          ust_set_tval(t.get_tval());
++      ust_set_interrupt(0);
++  }
++
+   if (state.dcsr.cause) {
+     if (t.cause() == CAUSE_BREAKPOINT) {
+       state.pc = DEBUG_ROM_ENTRY;
+@@ -272,6 +291,11 @@ void processor_t::take_trap(trap_t& t, reg_t epc)
+   reg_t bit = t.cause();
+   reg_t deleg = state.medeleg;
+   bool interrupt = (bit & ((reg_t)1 << (max_xlen-1))) != 0;
++
++  if (trace) {
++      ust_set_interrupt(interrupt);
++  }
++
+   if (interrupt)
+     deleg = state.mideleg, bit &= ~((reg_t)1 << (max_xlen-1));
+   if (state.prv <= PRV_S && bit < max_xlen && ((deleg >> bit) & 1)) {
+@@ -307,12 +331,22 @@ void processor_t::disasm(insn_t insn)
+ {
+   uint64_t bits = insn.bits() & ((1ULL << (8 * insn_length(insn.bits()))) - 1);
+   if (last_pc != state.pc || last_bits != bits) {
+-    if (executions != 1) {
++    if (debug && executions != 1) {
+       fprintf(stderr, "core %3d: Executed %" PRIx64 " times\n", id, executions);
+     }
+ 
+-    fprintf(stderr, "core %3d: 0x%016" PRIx64 " (0x%08" PRIx64 ") %s\n",
+-            id, state.pc, bits, disassembler->disassemble(insn).c_str());
++    if (debug) {
++      fprintf(stderr, "core %3d: 0x%016" PRIx64 " (0x%08" PRIx64 ") %s\n",
++              id, state.pc, bits, disassembler->disassemble(insn).c_str());
++    }
++
++    if (trace) {
++      ust_step();
++      ust_set_addr(state.pc);
++      ust_set_insn(bits);
++      ust_set_priv(state.prv);
++    }
++
+     last_pc = state.pc;
+     last_bits = bits;
+     executions = 1;
+diff --git a/riscv/processor.h b/riscv/processor.h
+index fd90ce3..2b41e75 100644
+--- a/riscv/processor.h
++++ b/riscv/processor.h
+@@ -166,6 +166,7 @@ public:
+   ~processor_t();
+ 
+   void set_debug(bool value);
++  void set_trace(bool value);
+   void set_histogram(bool value);
+   void reset();
+   void step(size_t n); // run for n cycles
+@@ -207,6 +208,8 @@ public:
+ 
+   // When true, display disassembly of each instruction that's executed.
+   bool debug;
++  // When true, write the UST trace
++  bool trace;
+   // When true, take the slow simulation path.
+   bool slow_path();
+   bool halted() { return state.dcsr.cause ? true : false; }
+diff --git a/riscv/riscv.mk.in b/riscv/riscv.mk.in
+index 80755e7..dc23eb8 100644
+--- a/riscv/riscv.mk.in
++++ b/riscv/riscv.mk.in
+@@ -29,6 +29,7 @@ riscv_hdrs = \
+ 	debug_rom_defines.h \
+ 	remote_bitbang.h \
+ 	jtag_dtm.h \
++	ust_tracer.h \
+ 
+ riscv_precompiled_hdrs = \
+ 	insn_template.h \
+@@ -53,6 +54,7 @@ riscv_srcs = \
+ 	debug_module.cc \
+ 	remote_bitbang.cc \
+ 	jtag_dtm.cc \
++	ust_tracer.cc \
+ 	$(riscv_gen_srcs) \
+ 
+ riscv_test_srcs =
+diff --git a/riscv/sim.cc b/riscv/sim.cc
+index 44223a7..6725e93 100644
+--- a/riscv/sim.cc
++++ b/riscv/sim.cc
+@@ -1,6 +1,7 @@
+ // See LICENSE for license details.
+ 
+ #include "sim.h"
++#include "ust_tracer.h"
+ #include "mmu.h"
+ #include "dts.h"
+ #include "remote_bitbang.h"
+@@ -30,7 +31,7 @@ sim_t::sim_t(const char* isa, size_t nprocs, bool halted, reg_t start_pc,
+              std::vector<int> const hartids, unsigned progsize,
+              unsigned max_bus_master_bits, bool require_authentication)
+   : htif_t(args), mems(mems), procs(std::max(nprocs, size_t(1))),
+-    start_pc(start_pc), current_step(0), current_proc(0), debug(false),
++    start_pc(start_pc), current_step(0), current_proc(0), debug(false), trace(false),
+     histogram_enabled(false), dtb_enabled(true), remote_bitbang(NULL),
+     debug_module(this, progsize, max_bus_master_bits, require_authentication)
+ {
+@@ -64,6 +65,7 @@ sim_t::sim_t(const char* isa, size_t nprocs, bool halted, reg_t start_pc,
+ 
+ sim_t::~sim_t()
+ {
++  ust_close();
+   for (size_t i = 0; i < procs.size(); i++)
+     delete procs[i];
+   delete debug_mmu;
+@@ -79,6 +81,9 @@ void sim_t::main()
+   if (!debug && log)
+     set_procs_debug(true);
+ 
++  if (!debug && trace)
++    set_procs_trace(true);
++
+   while (!done())
+   {
+     if (debug || ctrlc_pressed)
+@@ -130,6 +135,12 @@ void sim_t::set_log(bool value)
+   log = value;
+ }
+ 
++void sim_t::set_ust_trace(const char * const ust_file)
++{
++  ust_open(ust_file);
++  trace = true;
++}
++
+ void sim_t::set_histogram(bool value)
+ {
+   histogram_enabled = value;
+@@ -144,6 +155,12 @@ void sim_t::set_procs_debug(bool value)
+     procs[i]->set_debug(value);
+ }
+ 
++void sim_t::set_procs_trace(bool value)
++{
++  for (size_t i=0; i< procs.size(); i++)
++    procs[i]->set_trace(value);
++}
++
+ bool sim_t::mmio_load(reg_t addr, size_t len, uint8_t* bytes)
+ {
+   if (addr + len < addr)
+diff --git a/riscv/sim.h b/riscv/sim.h
+index b847bdb..8fbae3f 100644
+--- a/riscv/sim.h
++++ b/riscv/sim.h
+@@ -30,8 +30,10 @@ public:
+   int run();
+   void set_debug(bool value);
+   void set_log(bool value);
++  void set_ust_trace(const char * const ust_file);
+   void set_histogram(bool value);
+   void set_procs_debug(bool value);
++  void set_procs_trace(bool value);
+   void set_dtb_enabled(bool value) {
+     this->dtb_enabled = value;
+   }
+@@ -64,6 +66,7 @@ private:
+   size_t current_proc;
+   bool debug;
+   bool log;
++  bool trace;
+   bool histogram_enabled; // provide a histogram of PCs
+   bool dtb_enabled;
+   remote_bitbang_t* remote_bitbang;
+diff --git a/riscv/ust_tracer.cc b/riscv/ust_tracer.cc
+index e69de29..cf8bcd6 100644
+--- a/riscv/ust_tracer.cc
++++ b/riscv/ust_tracer.cc
+@@ -0,0 +1,72 @@
++// See LICENSE for license details.
++
++#include "ust_tracer.h"
++#include "trap.h"
++
++#include <cstdio>
++
++static reg_t s_addr = 0;
++static uint64_t s_insn = 0;
++static uint8_t s_prv = 0;
++static uint8_t s_ex = 0;
++static reg_t s_ex_cause = 0;
++static reg_t s_tval = 0;
++static uint8_t s_interrupt = 0;
++static FILE* s_trace = NULL;
++static bool has_output_header = false;
++
++void ust_open(const char *filename)
++{
++  s_trace = fopen(filename, "w");
++  if (!s_trace)
++    fprintf(stderr, "Failed to open ust trace file %s: %s",
++            filename, strerror(errno));
++}
++
++void ust_step(void)
++{
++  if (!s_trace)
++    return;
++
++  if (has_output_header) {
++    fprintf(s_trace, "1,%lx,%lx,%x,%x,%lx,%lx,%x\n",
++	    s_addr, s_insn, s_prv, s_ex, s_ex_cause, s_tval, s_interrupt);
++  } else {
++    fprintf(s_trace, "VALID,ADDRESS,INSN,PRIVILEGE,EXCEPTION,ECAUSE,TVAL,INTERRUPT\n");
++    has_output_header = true;
++  }
++
++  s_ex = 0;
++}
++
++void ust_close(void)
++{
++  if (s_trace)
++    fclose(s_trace);
++  s_trace = NULL;
++}
++
++void ust_set_addr(reg_t addr) {
++  s_addr = addr;
++}
++
++void ust_set_insn(uint64_t insn) {
++  s_insn = insn;
++}
++
++void ust_set_priv(uint8_t prv) {
++  s_prv = prv;
++}
++
++void ust_set_exception(reg_t cause) {
++  s_ex = 1;
++  s_ex_cause = cause;
++}
++
++void ust_set_tval(reg_t tval) {
++  s_tval = tval;
++}
++
++void ust_set_interrupt(uint8_t interrupt) {
++  s_interrupt = interrupt;
++}
+diff --git a/riscv/ust_tracer.h b/riscv/ust_tracer.h
+index e69de29..7eb6fc4 100644
+--- a/riscv/ust_tracer.h
++++ b/riscv/ust_tracer.h
+@@ -0,0 +1,19 @@
++// See LICENSE for license details.
++
++#ifndef _RISCV_UST_TRACER_H
++#define _RISCV_UST_TRACER_H
++
++#include "processor.h"
++
++void ust_open(const char *filename);
++void ust_start(void);
++void ust_step(void);
++void ust_close(void);
++void ust_set_addr(reg_t addr);
++void ust_set_insn(uint64_t insn);
++void ust_set_priv(uint8_t prv);
++void ust_set_exception(reg_t cause);
++void ust_set_tval(reg_t tval);
++void ust_set_interrupt(uint8_t interrupt);
++
++#endif
+diff --git a/spike_main/spike.cc b/spike_main/spike.cc
+index f922f24..bbaa64c 100644
+--- a/spike_main/spike.cc
++++ b/spike_main/spike.cc
+@@ -36,6 +36,7 @@ static void help()
+   fprintf(stderr, "  --extlib=<name>       Shared library to load\n");
+   fprintf(stderr, "  --rbb-port=<port>     Listen on <port> for remote bitbang connection\n");
+   fprintf(stderr, "  --dump-dts            Print device tree string and exit\n");
++  fprintf(stderr, "  --ust-trace=<file>    Write UST trace file\n");
+   fprintf(stderr, "  --disable-dtb         Don't write the device tree blob into memory\n");
+   fprintf(stderr, "  --progsize=<words>    Progsize for the debug module [default 2]\n");
+   fprintf(stderr, "  --debug-sba=<bits>    Debug bus master supports up to "
+@@ -91,6 +92,7 @@ int main(int argc, char** argv)
+   std::unique_ptr<cache_sim_t> l2;
+   std::function<extension_t*()> extension;
+   const char* isa = DEFAULT_ISA;
++  const char* ust_file = NULL;
+   uint16_t rbb_port = 0;
+   bool use_rbb = false;
+   unsigned progsize = 2;
+@@ -129,6 +131,7 @@ int main(int argc, char** argv)
+   parser.option(0, "isa", 1, [&](const char* s){isa = s;});
+   parser.option(0, "extension", 1, [&](const char* s){extension = find_extension(s);});
+   parser.option(0, "dump-dts", 0, [&](const char *s){dump_dts = true;});
++  parser.option(0, "ust-trace", 1, [&](const char *s){ust_file = s;});
+   parser.option(0, "disable-dtb", 0, [&](const char *s){dtb_enabled = false;});
+   parser.option(0, "extlib", 1, [&](const char *s){
+     void *lib = dlopen(s, RTLD_NOW | RTLD_GLOBAL);
+@@ -177,6 +180,7 @@ int main(int argc, char** argv)
+ 
+   s.set_debug(debug);
+   s.set_log(log);
++  s.set_ust_trace(ust_file);
+   s.set_histogram(histogram);
+   return s.run();
+ }
